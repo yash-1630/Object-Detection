@@ -1,0 +1,140 @@
+import cv2
+import pyttsx3
+import numpy as np
+import os
+import urllib.request
+import pytesseract
+from pyzbar.pyzbar import decode
+import time
+from gtts import gTTS
+import langdetect
+
+# Set Tesseract OCR path (Windows users)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# Download YOLOv3 files if not present
+def download_yolo_files():
+    files = {
+        "yolov3.weights": "https://pjreddie.com/media/files/yolov3.weights",
+        "yolov3.cfg": "https://github.com/pjreddie/darknet/raw/master/cfg/yolov3.cfg",
+        "coco.names": "https://github.com/pjreddie/darknet/raw/master/data/coco.names"
+    }
+    for file, url in files.items():
+        if not os.path.exists(file):
+            print(f"Downloading {file}...")
+            urllib.request.urlretrieve(url, file)
+
+# Run download check
+download_yolo_files()
+
+# Load YOLO model
+yolo_net = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
+layer_names = yolo_net.getLayerNames()
+out_layers = [layer_names[i - 1] for i in yolo_net.getUnconnectedOutLayers().flatten()]
+
+# Load COCO class labels
+if os.path.exists("coco.names"):
+    with open("coco.names", "r") as f:
+        classes = [line.strip() for line in f.readlines()]
+else:
+    classes = []
+
+# Initialize text-to-speech engine
+tts = pyttsx3.init()
+last_speak_time = 0
+last_barcode_time = 0
+COOLDOWN_SPEECH = 2  # Speak every 2 seconds
+COOLDOWN_BARCODE = 5  # Avoid repeating barcode announcements
+seen_barcodes = set()
+
+def speak(text):
+    """ Text-to-speech function using pyttsx3. """
+    global last_speak_time
+    if time.time() - last_speak_time > COOLDOWN_SPEECH:
+        tts.say(text)
+        tts.runAndWait()
+        last_speak_time = time.time()
+
+def speak_multilingual(text):
+    """ Text-to-speech function using Google TTS (multilingual support). """
+    lang = langdetect.detect(text)
+    tts = gTTS(text, lang=lang)
+    tts.save("speech.mp3")
+    os.system("start speech.mp3")
+
+# Open webcam
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    
+    height, width, channels = frame.shape
+    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), swapRB=True, crop=False)
+    yolo_net.setInput(blob)
+    outs = yolo_net.forward(out_layers)
+    
+    class_ids = []
+    confidences = []
+    boxes = []
+    
+    for out in outs:
+        for detection in out:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > 0.5:
+                center_x, center_y, w, h = (detection[0:4] * np.array([width, height, width, height])).astype("int")
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                boxes.append([x, y, int(w), int(h)])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+    
+    indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+    detected_objects = []
+    
+    if len(indexes) > 0:
+        for i in indexes.flatten():
+            x, y, w, h = boxes[i]
+            label = classes[class_ids[i]] if class_ids[i] < len(classes) else "Unknown"
+            detected_objects.append(label)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    if detected_objects:
+        speak("I see " + ", ".join(set(detected_objects)))
+    
+    # OCR on detected objects (Dynamic ROI)
+    for i in indexes.flatten():
+        x, y, w, h = boxes[i]
+        roi = frame[y:y + h, x:x + w]
+        if roi.size > 0:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            text = pytesseract.image_to_string(gray).strip()
+            if text:
+                print("Detected Text:", text)
+                speak_multilingual("The text says: " + text)
+    
+    # Barcode & QR Code Detection
+    barcodes = decode(frame)
+    for barcode in barcodes:
+        barcode_data = barcode.data.decode("utf-8")
+        if barcode_data not in seen_barcodes and time.time() - last_barcode_time > COOLDOWN_BARCODE:
+            print("Barcode:", barcode_data)
+            speak("Scanned barcode: " + barcode_data)
+            seen_barcodes.add(barcode_data)
+            last_barcode_time = time.time()
+
+        x, y, w, h = barcode.rect
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        cv2.putText(frame, barcode_data, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+    
+    cv2.imshow("Smart Assistant for Blind", frame)
+    
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
